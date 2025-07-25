@@ -2,11 +2,12 @@ from typing import Any, Dict, List, Optional, Union
 
 from redisvl.extensions.constants import (
     CONTENT_FIELD_NAME,
+    METADATA_FIELD_NAME,
     ROLE_FIELD_NAME,
     TOOL_FIELD_NAME,
 )
 from redisvl.extensions.message_history.schema import ChatMessage
-from redisvl.utils.utils import create_ulid
+from redisvl.utils.utils import create_ulid, deserialize
 
 
 class BaseMessageHistory:
@@ -60,7 +61,7 @@ class BaseMessageHistory:
         raw: bool = False,
         session_tag: Optional[str] = None,
     ) -> Union[List[str], List[Dict[str, str]]]:
-        """Retreive the recent conversation history in sequential order.
+        """Retrieve the recent conversation history in sequential order.
 
         Args:
             top_k (int): The number of previous exchanges to return. Default is 5.
@@ -111,6 +112,10 @@ class BaseMessageHistory:
                 }
                 if chat_message.tool_call_id is not None:
                     chat_message_dict[TOOL_FIELD_NAME] = chat_message.tool_call_id
+                if chat_message.metadata is not None:
+                    chat_message_dict[METADATA_FIELD_NAME] = deserialize(
+                        chat_message.metadata
+                    )
 
                 context.append(chat_message_dict)  # type: ignore
 

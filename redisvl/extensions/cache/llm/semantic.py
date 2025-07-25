@@ -31,6 +31,7 @@ from redisvl.utils.utils import (
     validate_vector_dims,
 )
 from redisvl.utils.vectorize.base import BaseVectorizer
+from redisvl.utils.vectorize.text.huggingface import HFTextVectorizer
 
 logger = get_logger("[RedisVL]")
 
@@ -104,23 +105,11 @@ class SemanticCache(BaseLLMCache):
                 )
             self._vectorizer = vectorizer
         else:
-            from redisvl.utils.vectorize.text.huggingface import HFTextVectorizer
-
-            # Create a default vectorizer
+            # Create the default vectorizer
             vectorizer_kwargs = kwargs
+
             if dtype:
                 vectorizer_kwargs.update(dtype=dtype)
-
-            # raise a warning to inform users we changed the default model
-            # remove this warning in future releases
-            logger.warning(
-                "The default vectorizer has changed from `sentence-transformers/all-mpnet-base-v2` "
-                "to `redis/langcache-embed-v1` in version 0.6.0 of RedisVL. "
-                "For more information about this model, please refer to https://arxiv.org/abs/2504.02268 "
-                "or visit https://huggingface.co/redis/langcache-embed-v1. "
-                "To continue using the old vectorizer, please specify it explicitly in the constructor as: "
-                "vectorizer=HFTextVectorizer(model='sentence-transformers/all-mpnet-base-v2')"
-            )
 
             self._vectorizer = HFTextVectorizer(
                 model="redis/langcache-embed-v1",
@@ -396,7 +385,7 @@ class SemanticCache(BaseLLMCache):
         .. code-block:: python
 
             response = cache.check(
-                prompt="What is the captial city of France?"
+                prompt="What is the capital city of France?"
             )
         """
         if not any([prompt, vector]):
@@ -487,7 +476,7 @@ class SemanticCache(BaseLLMCache):
         .. code-block:: python
 
             response = await cache.acheck(
-                prompt="What is the captial city of France?"
+                prompt="What is the capital city of France?"
             )
         """
         aindex = await self._get_async_index()
@@ -599,7 +588,7 @@ class SemanticCache(BaseLLMCache):
         .. code-block:: python
 
             key = cache.store(
-                prompt="What is the captial city of France?",
+                prompt="What is the capital city of France?",
                 response="Paris",
                 metadata={"city": "Paris", "country": "France"}
             )
@@ -667,7 +656,7 @@ class SemanticCache(BaseLLMCache):
         .. code-block:: python
 
             key = await cache.astore(
-                prompt="What is the captial city of France?",
+                prompt="What is the capital city of France?",
                 response="Paris",
                 metadata={"city": "Paris", "country": "France"}
             )

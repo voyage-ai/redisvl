@@ -1,23 +1,26 @@
 import os
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type
 from warnings import warn
 
-from redis import Redis
-from redis.asyncio import Connection as AsyncConnection
+from redis import Redis, RedisCluster
 from redis.asyncio import ConnectionPool as AsyncConnectionPool
 from redis.asyncio import Redis as AsyncRedis
-from redis.asyncio import SSLConnection as AsyncSSLConnection
-from redis.connection import AbstractConnection, SSLConnection
+from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
+from redis.asyncio.connection import AbstractConnection as AsyncAbstractConnection
+from redis.asyncio.connection import Connection as AsyncConnection
+from redis.asyncio.connection import SSLConnection as AsyncSSLConnection
+from redis.connection import SSLConnection
 from redis.exceptions import ResponseError
 
+from redisvl import __version__
 from redisvl.exceptions import RedisModuleVersionError
-from redisvl.redis.constants import DEFAULT_REQUIRED_MODULES
-from redisvl.redis.utils import convert_bytes
+from redisvl.redis.constants import DEFAULT_REQUIRED_MODULES, REDIS_URL_ENV_VAR
+from redisvl.redis.utils import convert_bytes, is_cluster_url
+from redisvl.types import AsyncRedisClient, RedisClient, SyncRedisClient
 from redisvl.utils.utils import deprecated_function
-from redisvl.version import __version__
 
 
-def compare_versions(version1, version2):
+def compare_versions(version1: str, version2: str):
     """
     Compare two Redis version strings numerically.
 
@@ -52,14 +55,11 @@ def unpack_redis_modules(module_list: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def get_address_from_env() -> str:
-    """Get a redis connection from environment variables.
-
-    Returns:
-        str: Redis URL
-    """
-    if "REDIS_URL" not in os.environ:
-        raise ValueError("REDIS_URL env var not set")
-    return os.environ["REDIS_URL"]
+    """Get Redis URL from environment variable."""
+    redis_url = os.getenv(REDIS_URL_ENV_VAR)
+    if not redis_url:
+        raise ValueError(f"{REDIS_URL_ENV_VAR} environment variable not set.")
+    return redis_url
 
 
 def make_lib_name(*args) -> str:
@@ -105,19 +105,27 @@ def convert_index_info_to_schema(index_info: Dict[str, Any]) -> Dict[str, Any]:
         # TODO 'WITHSUFFIXTRIE' is another boolean attr, but is not returned by ft.info
         original = attrs.copy()
         parsed_attrs = {}
-        if "NOSTEM" in attrs:
-            parsed_attrs["no_stem"] = True
-            attrs.remove("NOSTEM")
-        if "CASESENSITIVE" in attrs:
-            parsed_attrs["case_sensitive"] = True
-            attrs.remove("CASESENSITIVE")
-        if "SORTABLE" in attrs:
-            parsed_attrs["sortable"] = True
-            attrs.remove("SORTABLE")
-            if "UNF" in attrs:
-                attrs.remove("UNF")  # UNF present on sortable numeric fields only
+
+        # Handle all boolean attributes first, regardless of position
+        boolean_attrs = {
+            "NOSTEM": "no_stem",
+            "CASESENSITIVE": "case_sensitive",
+            "SORTABLE": "sortable",
+            "INDEXMISSING": "index_missing",
+            "INDEXEMPTY": "index_empty",
+        }
+
+        for redis_attr, python_attr in boolean_attrs.items():
+            if redis_attr in attrs:
+                parsed_attrs[python_attr] = True
+                attrs.remove(redis_attr)
+
+        # Handle UNF which is associated with SORTABLE
+        if "UNF" in attrs:
+            attrs.remove("UNF")  # UNF present on sortable numeric fields only
 
         try:
+            # Parse remaining attributes as key-value pairs starting from index 6
             parsed_attrs.update(
                 {attrs[i].lower(): attrs[i + 1] for i in range(6, len(attrs), 2)}
             )
@@ -196,7 +204,7 @@ class RedisConnectionFactory:
     )
     def connect(
         cls, redis_url: Optional[str] = None, use_async: bool = False, **kwargs
-    ) -> Union[Redis, AsyncRedis]:
+    ) -> RedisClient:
         """Create a connection to the Redis database based on a URL and some
         connection kwargs.
 
@@ -226,7 +234,7 @@ class RedisConnectionFactory:
         redis_url: Optional[str] = None,
         required_modules: Optional[List[Dict[str, Any]]] = None,
         **kwargs,
-    ) -> Redis:
+    ) -> SyncRedisClient:
         """Creates and returns a synchronous Redis client.
 
         Args:
@@ -246,12 +254,13 @@ class RedisConnectionFactory:
             RedisModuleVersionError: If required Redis modules are not installed.
         """
         url = redis_url or get_address_from_env()
-        client = Redis.from_url(url, **kwargs)
-
+        if is_cluster_url(url, **kwargs):
+            client = RedisCluster.from_url(url, **kwargs)
+        else:
+            client = Redis.from_url(url, **kwargs)
         RedisConnectionFactory.validate_sync_redis(
             client, required_modules=required_modules
         )
-
         return client
 
     @staticmethod
@@ -259,7 +268,7 @@ class RedisConnectionFactory:
         url: Optional[str] = None,
         required_modules: Optional[List[Dict[str, Any]]] = None,
         **kwargs,
-    ) -> AsyncRedis:
+    ) -> AsyncRedisClient:
         """Creates and returns an asynchronous Redis client.
 
         NOTE: This method is the future form of `get_async_redis_connection` but is
@@ -274,7 +283,7 @@ class RedisConnectionFactory:
                 Redis client constructor.
 
         Returns:
-            AsyncRedis: An asynchronous Redis client instance.
+            AsyncRedisClient: An asynchronous Redis client instance (either AsyncRedis or AsyncRedisCluster).
 
         Raises:
             ValueError: If url is not provided and REDIS_URL environment
@@ -282,7 +291,11 @@ class RedisConnectionFactory:
             RedisModuleVersionError: If required Redis modules are not installed.
         """
         url = url or get_address_from_env()
-        client = AsyncRedis.from_url(url, **kwargs)
+
+        if is_cluster_url(url, **kwargs):
+            client = AsyncRedisCluster.from_url(url, **kwargs)
+        else:
+            client = AsyncRedis.from_url(url, **kwargs)
 
         await RedisConnectionFactory.validate_async_redis(
             client, required_modules=required_modules
@@ -293,7 +306,7 @@ class RedisConnectionFactory:
     def get_async_redis_connection(
         url: Optional[str] = None,
         **kwargs,
-    ) -> AsyncRedis:
+    ) -> AsyncRedisClient:
         """Creates and returns an asynchronous Redis client.
 
         Args:
@@ -317,16 +330,44 @@ class RedisConnectionFactory:
         return AsyncRedis.from_url(url, **kwargs)
 
     @staticmethod
-    def sync_to_async_redis(redis_client: Redis) -> AsyncRedis:
+    def get_redis_cluster_connection(
+        redis_url: Optional[str] = None,
+        **kwargs,
+    ) -> RedisCluster:
+        """Creates and returns a synchronous Redis client for a Redis cluster."""
+        url = redis_url or get_address_from_env()
+        return RedisCluster.from_url(url, **kwargs)
+
+    @staticmethod
+    def get_async_redis_cluster_connection(
+        redis_url: Optional[str] = None,
+        **kwargs,
+    ) -> AsyncRedisCluster:
+        """Creates and returns an asynchronous Redis client for a Redis cluster."""
+        url = redis_url or get_address_from_env()
+        return AsyncRedisCluster.from_url(url, **kwargs)
+
+    @staticmethod
+    def sync_to_async_redis(
+        redis_client: SyncRedisClient,
+    ) -> AsyncRedisClient:
         """Convert a synchronous Redis client to an asynchronous one."""
+        if isinstance(redis_client, RedisCluster):
+            raise ValueError(
+                "RedisCluster is not supported for sync-to-async conversion."
+            )
+
+        # At this point, redis_client is guaranteed to be Redis type
+        assert isinstance(redis_client, Redis)  # Type narrowing for MyPy
+
         # pick the right connection class
-        connection_class: Type[AbstractConnection] = (
+        connection_class: Type[AsyncAbstractConnection] = (
             AsyncSSLConnection
             if redis_client.connection_pool.connection_class == SSLConnection
             else AsyncConnection
-        )  # type: ignore
+        )
         # make async client
-        return AsyncRedis.from_pool(  # type: ignore
+        return AsyncRedis.from_pool(
             AsyncConnectionPool(
                 connection_class=connection_class,
                 **redis_client.connection_pool.connection_kwargs,
@@ -334,30 +375,34 @@ class RedisConnectionFactory:
         )
 
     @staticmethod
-    def get_modules(client: Redis) -> Dict[str, Any]:
+    def get_modules(client: SyncRedisClient) -> Dict[str, Any]:
         return unpack_redis_modules(convert_bytes(client.module_list()))
 
     @staticmethod
-    async def get_modules_async(client: AsyncRedis) -> Dict[str, Any]:
+    async def get_modules_async(client: AsyncRedisClient) -> Dict[str, Any]:
         return unpack_redis_modules(convert_bytes(await client.module_list()))
 
     @staticmethod
     def validate_sync_redis(
-        redis_client: Redis,
+        redis_client: SyncRedisClient,
         lib_name: Optional[str] = None,
         required_modules: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Validates the sync Redis client."""
-        if not isinstance(redis_client, Redis):
-            raise TypeError("Invalid Redis client instance")
+        if not issubclass(type(redis_client), (Redis, RedisCluster)):
+            raise TypeError(
+                "Invalid Redis client instance. Must be Redis or RedisCluster."
+            )
 
         # Set client library name
         _lib_name = make_lib_name(lib_name)
         try:
-            redis_client.client_setinfo("LIB-NAME", _lib_name)  # type: ignore
+            redis_client.client_setinfo("LIB-NAME", _lib_name)
         except ResponseError:
             # Fall back to a simple log echo
-            redis_client.echo(_lib_name)
+            # For RedisCluster, echo is not available
+            if hasattr(redis_client, "echo"):
+                redis_client.echo(_lib_name)
 
         # Get list of modules
         installed_modules = RedisConnectionFactory.get_modules(redis_client)
@@ -367,18 +412,24 @@ class RedisConnectionFactory:
 
     @staticmethod
     async def validate_async_redis(
-        redis_client: AsyncRedis,
+        redis_client: AsyncRedisClient,
         lib_name: Optional[str] = None,
         required_modules: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Validates the async Redis client."""
+        if not issubclass(type(redis_client), (AsyncRedis, AsyncRedisCluster)):
+            raise TypeError(
+                "Invalid async Redis client instance. Must be async Redis or async RedisCluster."
+            )
         # Set client library name
         _lib_name = make_lib_name(lib_name)
         try:
-            await redis_client.client_setinfo("LIB-NAME", _lib_name)  # type: ignore
+            await redis_client.client_setinfo("LIB-NAME", _lib_name)
         except ResponseError:
             # Fall back to a simple log echo
             await redis_client.echo(_lib_name)
+            if hasattr(redis_client, "echo"):
+                await redis_client.echo(_lib_name)
 
         # Get list of modules
         installed_modules = await RedisConnectionFactory.get_modules_async(redis_client)

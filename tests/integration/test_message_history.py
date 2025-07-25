@@ -6,7 +6,7 @@ from redis.exceptions import ConnectionError
 from redisvl.exceptions import RedisModuleVersionError
 from redisvl.extensions.constants import ID_FIELD_NAME
 from redisvl.extensions.message_history import MessageHistory, SemanticMessageHistory
-from redisvl.utils.vectorize.text.huggingface import HFTextVectorizer
+from tests.conftest import skip_if_module_version_error
 
 
 @pytest.fixture
@@ -22,8 +22,10 @@ def standard_history(app_name, client):
 
 
 @pytest.fixture
-def semantic_history(app_name, client):
-    history = SemanticMessageHistory(app_name, redis_client=client, overwrite=True)
+def semantic_history(app_name, client, hf_vectorizer):
+    history = SemanticMessageHistory(
+        app_name, redis_client=client, overwrite=True, vectorizer=hf_vectorizer
+    )
     yield history
     history.clear()
     history.delete()
@@ -99,6 +101,7 @@ def test_standard_add_and_get(standard_history):
             "role": "tool",
             "content": "tool result 1",
             "tool_call_id": "tool call one",
+            "metadata": {"tool call params": "abc 123"},
         }
     )
     standard_history.add_message(
@@ -106,6 +109,7 @@ def test_standard_add_and_get(standard_history):
             "role": "tool",
             "content": "tool result 2",
             "tool_call_id": "tool call two",
+            "metadata": {"tool call params": "abc 456"},
         }
     )
     standard_history.add_message({"role": "user", "content": "third prompt"})
@@ -119,7 +123,12 @@ def test_standard_add_and_get(standard_history):
     partial_context = standard_history.get_recent(top_k=3)
     assert len(partial_context) == 3
     assert partial_context == [
-        {"role": "tool", "content": "tool result 2", "tool_call_id": "tool call two"},
+        {
+            "role": "tool",
+            "content": "tool result 2",
+            "tool_call_id": "tool call two",
+            "metadata": {"tool call params": "abc 456"},
+        },
         {"role": "user", "content": "third prompt"},
         {"role": "llm", "content": "third response"},
     ]
@@ -131,8 +140,18 @@ def test_standard_add_and_get(standard_history):
         {"role": "llm", "content": "first response"},
         {"role": "user", "content": "second prompt"},
         {"role": "llm", "content": "second response"},
-        {"role": "tool", "content": "tool result 1", "tool_call_id": "tool call one"},
-        {"role": "tool", "content": "tool result 2", "tool_call_id": "tool call two"},
+        {
+            "role": "tool",
+            "content": "tool result 1",
+            "tool_call_id": "tool call one",
+            "metadata": {"tool call params": "abc 123"},
+        },
+        {
+            "role": "tool",
+            "content": "tool result 2",
+            "tool_call_id": "tool call two",
+            "metadata": {"tool call params": "abc 456"},
+        },
         {"role": "user", "content": "third prompt"},
         {"role": "llm", "content": "third response"},
     ]
@@ -158,7 +177,11 @@ def test_standard_add_messages(standard_history):
     standard_history.add_messages(
         [
             {"role": "user", "content": "first prompt"},
-            {"role": "llm", "content": "first response"},
+            {
+                "role": "llm",
+                "content": "first response",
+                "metadata": {"llm provider": "openai"},
+            },
             {"role": "user", "content": "second prompt"},
             {"role": "llm", "content": "second response"},
             {
@@ -180,7 +203,11 @@ def test_standard_add_messages(standard_history):
     assert len(full_context) == 8
     assert full_context == [
         {"role": "user", "content": "first prompt"},
-        {"role": "llm", "content": "first response"},
+        {
+            "role": "llm",
+            "content": "first response",
+            "metadata": {"llm provider": "openai"},
+        },
         {"role": "user", "content": "second prompt"},
         {"role": "llm", "content": "second response"},
         {"role": "tool", "content": "tool result 1", "tool_call_id": "tool call one"},
@@ -196,8 +223,12 @@ def test_standard_messages_property(standard_history):
             {"role": "user", "content": "first prompt"},
             {"role": "llm", "content": "first response"},
             {"role": "user", "content": "second prompt"},
-            {"role": "llm", "content": "second response"},
-            {"role": "user", "content": "third prompt"},
+            {
+                "role": "llm",
+                "content": "second response",
+                "metadata": {"params": "abc"},
+            },
+            {"role": "user", "content": "third prompt", "metadata": 42},
         ]
     )
 
@@ -205,8 +236,8 @@ def test_standard_messages_property(standard_history):
         {"role": "user", "content": "first prompt"},
         {"role": "llm", "content": "first response"},
         {"role": "user", "content": "second prompt"},
-        {"role": "llm", "content": "second response"},
-        {"role": "user", "content": "third prompt"},
+        {"role": "llm", "content": "second response", "metadata": {"params": "abc"}},
+        {"role": "user", "content": "third prompt", "metadata": 42},
     ]
 
 
@@ -296,19 +327,24 @@ def test_standard_clear(standard_history):
 
 
 # test semantic message history
-def test_semantic_specify_client(client):
+def test_semantic_specify_client(client, hf_vectorizer):
     history = SemanticMessageHistory(
-        name="test_app", session_tag="abc", redis_client=client, overwrite=True
+        name="test_app",
+        session_tag="abc",
+        redis_client=client,
+        overwrite=True,
+        vectorizer=hf_vectorizer,
     )
     assert isinstance(history._index.client, type(client))
 
 
-def test_semantic_bad_connection_info():
+def test_semantic_bad_connection_info(hf_vectorizer):
     with pytest.raises(ConnectionError):
         SemanticMessageHistory(
             name="test_app",
             session_tag="abc",
             redis_url="redis://localhost:6389",
+            vectorizer=hf_vectorizer,
         )
 
 
@@ -350,7 +386,14 @@ def test_semantic_store_and_get_recent(semantic_history):
     semantic_history.add_message(
         {"role": "tool", "content": "tool result", "tool_call_id": "tool id"}
     )
-    # test default context history size
+    semantic_history.add_message(
+        {
+            "role": "tool",
+            "content": "tool result",
+            "tool_call_id": "tool id",
+            "metadata": "return value from tool",
+        }
+    )  # test default context history size
     default_context = semantic_history.get_recent()
     assert len(default_context) == 5  # 5 is default
 
@@ -360,10 +403,10 @@ def test_semantic_store_and_get_recent(semantic_history):
 
     # test larger context history returns full history
     too_large_context = semantic_history.get_recent(top_k=100)
-    assert len(too_large_context) == 9
+    assert len(too_large_context) == 10
 
     # test that order is maintained
-    full_context = semantic_history.get_recent(top_k=9)
+    full_context = semantic_history.get_recent(top_k=10)
     assert full_context == [
         {"role": "user", "content": "first prompt"},
         {"role": "llm", "content": "first response"},
@@ -374,15 +417,26 @@ def test_semantic_store_and_get_recent(semantic_history):
         {"role": "user", "content": "fourth prompt"},
         {"role": "llm", "content": "fourth response"},
         {"role": "tool", "content": "tool result", "tool_call_id": "tool id"},
+        {
+            "role": "tool",
+            "content": "tool result",
+            "tool_call_id": "tool id",
+            "metadata": "return value from tool",
+        },
     ]
 
     # test that more recent entries are returned
     context = semantic_history.get_recent(top_k=4)
     assert context == [
-        {"role": "llm", "content": "third response"},
         {"role": "user", "content": "fourth prompt"},
         {"role": "llm", "content": "fourth response"},
         {"role": "tool", "content": "tool result", "tool_call_id": "tool id"},
+        {
+            "role": "tool",
+            "content": "tool result",
+            "tool_call_id": "tool id",
+            "metadata": "return value from tool",
+        },
     ]
 
     # test no entries are returned and no error is raised if top_k == 0
@@ -415,11 +469,13 @@ def test_semantic_messages_property(semantic_history):
                 "role": "tool",
                 "content": "tool result 1",
                 "tool_call_id": "tool call one",
+                "metadata": 42,
             },
             {
                 "role": "tool",
                 "content": "tool result 2",
                 "tool_call_id": "tool call two",
+                "metadata": [1, 2, 3],
             },
             {"role": "user", "content": "second prompt"},
             {"role": "llm", "content": "second response"},
@@ -430,8 +486,18 @@ def test_semantic_messages_property(semantic_history):
     assert semantic_history.messages == [
         {"role": "user", "content": "first prompt"},
         {"role": "llm", "content": "first response"},
-        {"role": "tool", "content": "tool result 1", "tool_call_id": "tool call one"},
-        {"role": "tool", "content": "tool result 2", "tool_call_id": "tool call two"},
+        {
+            "role": "tool",
+            "content": "tool result 1",
+            "tool_call_id": "tool call one",
+            "metadata": 42,
+        },
+        {
+            "role": "tool",
+            "content": "tool result 2",
+            "tool_call_id": "tool call two",
+            "metadata": [1, 2, 3],
+        },
         {"role": "user", "content": "second prompt"},
         {"role": "llm", "content": "second response"},
         {"role": "user", "content": "third prompt"},
@@ -552,38 +618,50 @@ def test_semantic_drop(semantic_history):
     ]
 
 
-def test_different_vector_dtypes():
+def test_different_vector_dtypes(redis_url):
     try:
-        bfloat_sess = SemanticMessageHistory(name="bfloat_history", dtype="bfloat16")
+        bfloat_sess = SemanticMessageHistory(
+            name="bfloat_history", dtype="bfloat16", redis_url=redis_url
+        )
         bfloat_sess.add_message({"role": "user", "content": "bfloat message"})
 
-        float16_sess = SemanticMessageHistory(name="float16_history", dtype="float16")
+        float16_sess = SemanticMessageHistory(
+            name="float16_history", dtype="float16", redis_url=redis_url
+        )
         float16_sess.add_message({"role": "user", "content": "float16 message"})
 
-        float32_sess = SemanticMessageHistory(name="float32_history", dtype="float32")
+        float32_sess = SemanticMessageHistory(
+            name="float32_history", dtype="float32", redis_url=redis_url
+        )
         float32_sess.add_message({"role": "user", "content": "float32 message"})
 
-        float64_sess = SemanticMessageHistory(name="float64_history", dtype="float64")
+        float64_sess = SemanticMessageHistory(
+            name="float64_history", dtype="float64", redis_url=redis_url
+        )
         float64_sess.add_message({"role": "user", "content": "float64 message"})
 
         for sess in [bfloat_sess, float16_sess, float32_sess, float64_sess]:
             sess.set_distance_threshold(0.7)
             assert len(sess.get_relevant("float message")) == 1
+            sess.delete()  # Clean up
     except:
-        pytest.skip("Not using a late enough version of Redis")
+        pytest.skip("Required Redis modules not available or version too low")
 
 
 def test_bad_dtype_connecting_to_exiting_history(redis_url):
-    try:
-        history = SemanticMessageHistory(
+    def create_history():
+        return SemanticMessageHistory(
             name="float64 history", dtype="float64", redis_url=redis_url
         )
-        same_type = SemanticMessageHistory(
+
+    def create_same_type():
+        return SemanticMessageHistory(
             name="float64 history", dtype="float64", redis_url=redis_url
         )
-        # under the hood uses from_existing
-    except RedisModuleVersionError:
-        pytest.skip("Not using a late enough version of Redis")
+
+    history = skip_if_module_version_error(create_history)
+    same_type = skip_if_module_version_error(create_same_type)
+    # under the hood uses from_existing
 
     with pytest.raises(ValueError):
         bad_type = SemanticMessageHistory(
